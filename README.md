@@ -56,7 +56,77 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/waybills` | 列出全部运单 |
 | POST | `/api/waybills/{waybill_id}/scans/batch` | 批量提交交接 / 更正 / 撤回 |
 | GET | `/api/waybills/{waybill_id}/chain` | 查询可信前缀、断链原因、当前保管方 |
-| GET | `/docs` | Swagger UI，可直接录入与查询 |
+| POST | `/api/waybills/{waybill_id}/seals` | 封存当前已提交状态的可信前缀与首处断链时刻 |
+| GET | `/api/waybills/{waybill_id}/seals/{seal_id}` | 读取封存元数据与留存摘要 |
+| POST | `/api/waybills/{waybill_id}/proofs` | 凭封存号与 UTC 时间窗申请核查证明 |
+| POST | `/api/verify` | 凭留存摘要与证明离线验真，不读取原库 |
+| GET | `/docs` | Swagger UI，可直接录入、封存、出证与验真 |
+
+## 封存、出证与离线验真
+
+保险方只索取某段时间的核查证据，服务按"封存 → 出证 → 验真"三步给出可离线核验的结论。
+
+### 1. 封存（seal）
+
+`POST /api/waybills/{waybill_id}/seals` 在单个 `BEGIN IMMEDIATE` 事务内对**同一已提交
+状态**计算可信前缀，并把该前缀不可变地复制到封存表：之后的补报、更正、撤回或进程重启
+都不会改变封存内容，仍可用原封存号出证、沿用原摘要。封存失败不留任何记录。
+
+每条封存交接计算叶子哈希（含运单号、序号、scan_id、修订号、UTC 时刻、交出方、接收方），
+叶子再汇总为 Merkle 根与清单哈希（manifest hash）。封存同时记录**首处断链时刻与原因**。
+
+返回体中的 `requested_digests` 是可另行留存的摘要：只取 0、1、3、7、15… 号位置，
+n 条封存交接至多签发 `floor(log2(n)) + 1` 条摘要（对数增长）。每条摘要的哈希预映像绑定
+封存号、运单号、清单哈希、Merkle 根、叶子总数、对应叶子哈希与断链界限。
+
+### 2. 出证（proof）
+
+`POST /api/waybills/{waybill_id}/proofs` 提交封存号与 UTC 半开时间窗
+`[start_utc, end_utc)`——**起点必须严格早于终点，含起点、不含终点**，时刻须带时区偏移。
+结论只有三种：
+
+| 条件 | 结论 | 附带内容 |
+| --- | --- | --- |
+| 窗内存在已证实交接 | `HAS_RECORD` | 窗内全部交接（含序号、时刻、当事方与 Merkle 路径） |
+| 窗内无交接，但窗尾晚于首处断链时刻 | `INSUFFICIENT_EVIDENCE` | 断链界限 |
+| 其余（窗内无交接且未越过断链） | `EMPTY_WINDOW` | 断链界限、窗外紧邻交接（before/after 邻居）及必要序号与摘要 |
+
+空窗证明的紧邻性由**封存序号连续性**保证：双侧邻居满足 `after.idx = before.idx + 1`，
+单侧边界对照封存首尾序号（idx 0 / leaf_count−1），数学上排除窗内被隐藏的交接。
+每个窗内条目与邻居都带 Merkle 认证路径，可独立验证其属于封存时的 Merkle 根。
+证明整体再做一次 `proof_hash`，覆盖信封内全部字段。
+
+### 3. 验真（verify）
+
+`POST /api/verify` 只需要：运单号、封存号、时间窗、留存摘要与证明信封——**全程不读取
+数据库**，即使原库被替换或服务重启也不影响结论。验真会逐项重算：
+
+1. 运单号/封存号/时间窗与证明信封一致；
+2. `proof_hash` 覆盖信封全部内容，任何字段改动都会失配；
+3. 每条留存摘要哈希（绑定根、叶子总数与断链界限）；
+4. 窗内条目与邻居的叶子哈希（时刻、当事方等字段改动即失配）及其 Merkle 路径到根；
+5. 窗口半开区间归属、邻居序号连续性，并从零重推三种结论规则。
+
+因此：改动相邻交接的时刻、跳过更靠近窗口的交接、调换运单号或封存号、伪造断链界限、
+伪造 Merkle 根或叶子总数，均无法通过验真。**空前缀封存**与**只有一侧边界**的合法
+空窗证明同样可以通过验真。
+
+### 端点示例
+
+```bash
+# 封存
+curl -X POST http://localhost:8000/api/waybills/AWB-001/seals
+
+# 申请证明（半开窗 [09:30, 11:30)）
+curl -X POST http://localhost:8000/api/waybills/AWB-001/proofs \
+  -H 'Content-Type: application/json' \
+  -d '{"seal_id":"<seal_id>","start_utc":"2026-11-18T09:30:00Z","end_utc":"2026-11-18T11:30:00Z"}'
+
+# 离线验真（证明信封中的 requested_digests 即留存摘要）
+curl -X POST http://localhost:8000/api/verify -H 'Content-Type: application/json' \
+  -d '{"waybill_id":"AWB-001","seal_id":"<seal_id>","start_utc":"...","end_utc":"...",
+       "retained_digests":[...],"proof":{...}}'
+```
 
 ### 交接批次示例
 
@@ -104,6 +174,9 @@ pip install pytest httpx
 pytest -q
 ```
 
-共 27 个用例，覆盖：乱序补传归位、时区归一化、最高修订裁决、同修订异文整批回滚、
+共 50 个用例，覆盖：乱序补传归位、时区归一化、最高修订裁决、同修订异文整批回滚、
 撤回与补报修复断链、GAP/SIMULTANEOUS 检测、输入校验、真实线程下的写串行化、
-交错读不到混合修订，以及进程重启持久化。
+交错读不到混合修订、进程重启持久化；以及封存快照与不可变性、摘要对数增长、
+三类出证结论与半开区间边界、单侧边界与空前缀封存、离线验真、时刻/当事方/叶子/
+Merkle 路径/运单号/封存号/断链界限等各类篡改均被拒绝、封存与提交交错只见已提交状态、
+封存跨重启继续出证。

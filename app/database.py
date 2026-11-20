@@ -46,6 +46,38 @@ CREATE TABLE IF NOT EXISTS scans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_scans_waybill ON scans (waybill_id, scan_id, revision);
+
+-- Immutable evidence seals.  A seal snapshots the verified prefix *as of one
+-- committed state*: later corrections / withdrawals / restarts never mutate
+-- these rows, so proofs stay reproducible from the original seal and digests.
+CREATE TABLE IF NOT EXISTS seals (
+    seal_id                 TEXT PRIMARY KEY,
+    waybill_id              TEXT NOT NULL REFERENCES waybills(id),
+    sealed_at               TEXT NOT NULL,
+    manifest_hash           TEXT NOT NULL,
+    root_hash               TEXT NOT NULL,
+    entry_count             INTEGER NOT NULL,
+    leaf_count              INTEGER NOT NULL,
+    first_break_ts          TEXT,
+    break_reason            TEXT,
+    first_break_scan_ids    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS seal_entries (
+    seal_id     TEXT NOT NULL REFERENCES seals(seal_id),
+    idx         INTEGER NOT NULL,
+    seq         INTEGER NOT NULL,
+    scan_id     TEXT NOT NULL,
+    revision    INTEGER NOT NULL,
+    ts_utc      TEXT NOT NULL,
+    giver       TEXT NOT NULL,
+    receiver    TEXT NOT NULL,
+    leaf_hash   TEXT NOT NULL,
+    digest      TEXT,
+    PRIMARY KEY (seal_id, idx)
+);
+
+CREATE INDEX IF NOT EXISTS idx_seal_entries_seal ON seal_entries (seal_id, idx);
 """
 
 

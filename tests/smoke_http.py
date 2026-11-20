@@ -87,4 +87,94 @@ st, body = call("POST", "/api/waybills/AWB-SMOKE/scans/batch", {"scans": [
 ]})
 check("naive timestamp -> 422", st == 422)
 
+# ---------------- evidence: seal -> proof -> offline verify ---------------- #
+st, body = call("POST", "/api/waybills/AWB-SMOKE/seals")
+check("seal created", st == 201, st)
+seal_id = body["seal_id"]
+digests = body["requested_digests"]
+# S1(08:00),S2(09:00),S3(10:00) verified; S4/S5 simultaneous at 11:00 -> break
+check("seal has 3 verified handovers", body["entry_count"] == 3, body["entry_count"])
+check("seal digests are sparse", [d["idx"] for d in digests] == [0, 1], digests)
+check("seal records the SIMULTANEOUS break",
+      body["first_break_ts"] is not None and body["break_reason"] == "SIMULTANEOUS", body)
+
+st, body = call("GET", f"/api/waybills/AWB-SMOKE/seals/{seal_id}")
+check("get seal", st == 200 and body["seal_id"] == seal_id)
+
+# HAS_RECORD window: [08:30, 10:30) covers S2 (09:00) and S3 (10:00)
+window = {"seal_id": seal_id,
+          "start_utc": "2026-11-18T08:30:00Z", "end_utc": "2026-11-18T10:30:00Z"}
+st, body = call("POST", "/api/waybills/AWB-SMOKE/proofs", window)
+check("HAS_RECORD proof", st == 200 and body["proof"]["result"] == "HAS_RECORD", body)
+check("proof entries are S2,S3",
+      [e["scan_id"] for e in body["proof"]["in_window_entries"]] == ["S2", "S3"])
+check("entries carry Merkle paths",
+      all(e["auth_path"] for e in body["proof"]["in_window_entries"]))
+proof = body["proof"]
+st, body = call("POST", "/api/verify", {
+    "waybill_id": "AWB-SMOKE", "seal_id": seal_id,
+    "start_utc": window["start_utc"], "end_utc": window["end_utc"],
+    "retained_digests": digests, "proof": proof,
+})
+check("verify HAS_RECORD offline", st == 200 and body["valid"] is True and body["result"] == "HAS_RECORD", body)
+
+# EMPTY_WINDOW after S3 (10:00), ending before the 11:00 break: before-only neighbor
+window2 = {"seal_id": seal_id,
+           "start_utc": "2026-11-18T10:30:00Z", "end_utc": "2026-11-18T10:45:00Z"}
+st, body = call("POST", "/api/waybills/AWB-SMOKE/proofs", window2)
+check("EMPTY_WINDOW proof", st == 200 and body["proof"]["result"] == "EMPTY_WINDOW", body)
+check("empty proof has only the before neighbor",
+      [n["side"] for n in body["proof"]["neighbors"]] == ["before"])
+st, body = call("POST", "/api/verify", {
+    "waybill_id": "AWB-SMOKE", "seal_id": seal_id,
+    "start_utc": window2["start_utc"], "end_utc": window2["end_utc"],
+    "retained_digests": digests, "proof": body["proof"],
+})
+check("verify EMPTY_WINDOW offline", st == 200 and body["valid"] is True, body)
+
+# Window extending past the 11:00 break with no in-window handover -> insufficient
+window3 = {"seal_id": seal_id,
+           "start_utc": "2026-11-18T10:30:00Z", "end_utc": "2026-11-18T12:00:00Z"}
+st, body = call("POST", "/api/waybills/AWB-SMOKE/proofs", window3)
+check("INSUFFICIENT_EVIDENCE proof",
+      st == 200 and body["proof"]["result"] == "INSUFFICIENT_EVIDENCE", body)
+st, body = call("POST", "/api/verify", {
+    "waybill_id": "AWB-SMOKE", "seal_id": seal_id,
+    "start_utc": window3["start_utc"], "end_utc": window3["end_utc"],
+    "retained_digests": digests, "proof": body["proof"],
+})
+check("verify INSUFFICIENT_EVIDENCE offline", st == 200 and body["valid"] is True, body)
+
+# tamper: alter an entry timestamp -> verification must fail
+import copy as _copy
+bad = _copy.deepcopy(proof)
+bad["in_window_entries"][0]["ts_utc"] = "2026-11-18T09:01:00Z"
+st, body = call("POST", "/api/verify", {
+    "waybill_id": "AWB-SMOKE", "seal_id": seal_id,
+    "start_utc": window["start_utc"], "end_utc": window["end_utc"],
+    "retained_digests": digests, "proof": bad,
+})
+check("tampered proof rejected", st == 200 and body["valid"] is False, body)
+
+# waybill swap rejected
+bad = _copy.deepcopy(proof)
+st, body = call("POST", "/api/verify", {
+    "waybill_id": "OTHER-WB", "seal_id": seal_id,
+    "start_utc": window["start_utc"], "end_utc": window["end_utc"],
+    "retained_digests": digests, "proof": bad,
+})
+check("waybill swap rejected", st == 200 and body["valid"] is False, body)
+
+# invalid window: start == end -> 422
+st, body = call("POST", "/api/waybills/AWB-SMOKE/proofs", {
+    "seal_id": seal_id,
+    "start_utc": "2026-11-18T10:00:00Z", "end_utc": "2026-11-18T10:00:00Z"})
+check("zero-length window -> 422", st == 422, st)
+
+# unknown seal -> 404
+st, body = call("POST", "/api/waybills/AWB-SMOKE/proofs", {
+    "seal_id": "nope",
+    "start_utc": "2026-11-18T10:00:00Z", "end_utc": "2026-11-18T11:00:00Z"})
+check("unknown seal -> 404", st == 404, st)
+
 print("ALL SMOKE CHECKS PASSED")

@@ -163,6 +163,187 @@ class BatchResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Evidence seals, time-window proofs and offline verification
+# --------------------------------------------------------------------------- #
+class SealDigestOut(BaseModel):
+    """A separately retainable summary (sparse, O(log n) of sealed entries)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    idx: int
+    seq: int
+    ts_utc: datetime
+    scan_id: str
+    leaf_hash: str
+    digest: str
+
+
+class SealResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    seal_id: str
+    waybill_id: str
+    sealed_at: datetime
+    entry_count: int
+    leaf_count: int
+    manifest_hash: str
+    root_hash: str
+    first_break_ts: datetime | None
+    break_reason: BreakReason | None
+    first_break_scan_ids: list[str]
+    requested_digests: list[SealDigestOut]
+
+
+class WindowRequest(BaseModel):
+    """Common validation for half-open UTC windows [start, end)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seal_id: str = Field(min_length=1)
+    start_utc: datetime
+    end_utc: datetime
+
+    @field_validator("seal_id")
+    @classmethod
+    def _strip_seal_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("start_utc", "end_utc")
+    @classmethod
+    def _require_timezone(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("timestamps must carry an explicit timezone offset, e.g. ...Z or +08:00")
+        return v
+
+    @model_validator(mode="after")
+    def _check_window_order(self) -> "WindowRequest":
+        if self.start_utc >= self.end_utc:
+            raise ValueError("start_utc must be strictly earlier than end_utc (window is [start, end))")
+        return self
+
+
+class MerkleStep(BaseModel):
+    """One authentication-path sibling. ``side`` is the sibling's position."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    side: Literal["L", "R"]
+    hash: str
+
+
+class ProofEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idx: int
+    seq: int
+    scan_id: str
+    revision: int
+    ts_utc: datetime
+    giver: str
+    receiver: str
+    leaf_hash: str
+    auth_path: list[MerkleStep]
+
+
+class ProofNeighbor(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    side: Literal["before", "after"]
+    idx: int
+    seq: int
+    scan_id: str
+    revision: int
+    ts_utc: datetime
+    giver: str
+    receiver: str
+    leaf_hash: str
+    auth_path: list[MerkleStep]
+
+
+class ProofDigest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    idx: int
+    seq: int
+    ts_utc: datetime
+    scan_id: str
+    leaf_hash: str
+    digest: str
+
+
+class ProofEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    seal_id: str
+    waybill_id: str
+    manifest_hash: str
+    root_hash: str
+    leaf_count: int
+    window_start_utc: datetime
+    window_end_utc: datetime
+    result: Literal["HAS_RECORD", "INSUFFICIENT_EVIDENCE", "EMPTY_WINDOW"]
+    break_reason: BreakReason | None
+    first_break_ts: datetime | None
+    break_scan_ids: list[str]
+    in_window_entries: list[ProofEntry]
+    neighbors: list[ProofNeighbor]
+    requested_digests: list[ProofDigest]
+    proof_hash: str
+
+
+class ProofResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proof: ProofEnvelope
+
+
+class VerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    waybill_id: str = Field(min_length=1)
+    seal_id: str = Field(min_length=1)
+    start_utc: datetime
+    end_utc: datetime
+    retained_digests: list[ProofDigest]
+    proof: ProofEnvelope
+
+    @field_validator("waybill_id", "seal_id")
+    @classmethod
+    def _strip_ids(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+    @field_validator("start_utc", "end_utc")
+    @classmethod
+    def _require_timezone(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("timestamps must carry an explicit timezone offset, e.g. ...Z or +08:00")
+        return v
+
+    @model_validator(mode="after")
+    def _check_window_order(self) -> "VerifyRequest":
+        if self.start_utc >= self.end_utc:
+            raise ValueError("start_utc must be strictly earlier than end_utc (window is [start, end))")
+        return self
+
+
+class VerifyResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    valid: bool
+    result: Literal["HAS_RECORD", "INSUFFICIENT_EVIDENCE", "EMPTY_WINDOW"] | None = None
+    reason: str | None = None
+    proof_hash: str | None = None
+    retained_digest_count: int
+    retained_digest_used: int
+
+
+# --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 def utcnow_iso() -> str:

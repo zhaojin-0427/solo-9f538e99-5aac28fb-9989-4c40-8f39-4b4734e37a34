@@ -75,6 +75,41 @@
   </div>
 
   <div class="card">
+    <h2>4. 封存可信前缀（/docs 亦可）</h2>
+    <label>运单号</label>
+    <div class="row"><input id="seal-wb" value="AWB-001" />
+      <button onclick="createSeal()" style="margin-top:0">封存</button></div>
+    <div class="hint">返回封存号与可另行留存的摘要（数量随封存交接数对数增长）。</div>
+  </div>
+
+  <div class="card">
+    <h2>5. 申请时间窗证明（[起点, 终点)）</h2>
+    <label>运单号 / 封存号</label>
+    <div class="row"><input id="proof-wb" value="AWB-001" />
+      <input id="proof-seal" placeholder="seal_id" /></div>
+    <label>UTC 起点（含）/ 终点（不含）</label>
+    <div class="row"><input id="proof-start" value="2026-11-18T09:30:00Z" />
+      <input id="proof-end" value="2026-11-18T11:30:00Z" /></div>
+    <button onclick="issueProof()">申请证明</button>
+    <div class="hint">结论：HAS_RECORD（窗内有已证实交接）/ INSUFFICIENT_EVIDENCE（越过首处断链）/ EMPTY_WINDOW（空窗证明）。</div>
+  </div>
+
+  <div class="card">
+    <h2>6. 离线验真（无需读库）</h2>
+    <label>验真请求 JSON（运单号、封存号、时间窗、留存摘要、证明）</label>
+    <textarea id="verify-json" style="min-height:120px">
+{
+  "waybill_id": "AWB-001",
+  "seal_id": "粘贴封存号",
+  "start_utc": "2026-11-18T09:30:00Z",
+  "end_utc": "2026-11-18T11:30:00Z",
+  "retained_digests": [],
+  "proof": {}
+}</textarea>
+    <button onclick="verifyProof()">验真</button>
+  </div>
+
+  <div class="card">
     <h2>原始响应</h2>
     <pre id="raw">（提交或查询后显示）</pre>
   </div>
@@ -116,6 +151,46 @@ async function queryChain() {
     const data = await call(`/api/waybills/${encodeURIComponent($('query-wb').value.trim())}/chain`, 'GET');
     setStatus('查询完成'); renderChain(data);
   } catch (e) { setStatus('查询失败：' + e.message, true); }
+}
+async function createSeal() {
+  const wb = $('seal-wb').value.trim();
+  try {
+    const data = await call(`/api/waybills/${encodeURIComponent(wb)}/seals`, 'POST');
+    $('proof-wb').value = wb;
+    $('proof-seal').value = data.seal_id;
+    setStatus(`已封存：${data.entry_count} 条已证实交接，${data.requested_digests.length} 条摘要，请妥善留存`);
+  } catch (e) { setStatus('封存失败：' + e.message, true); }
+}
+async function issueProof() {
+  const wb = $('proof-wb').value.trim();
+  const body = {
+    seal_id: $('proof-seal').value.trim(),
+    start_utc: $('proof-start').value.trim(),
+    end_utc: $('proof-end').value.trim()
+  };
+  try {
+    const data = await call(`/api/waybills/${encodeURIComponent(wb)}/proofs`, 'POST', body);
+    const p = data.proof;
+    setStatus(`证明已出具：${p.result}（proof_hash ${p.proof_hash.slice(0, 12)}…）`);
+    // prefill the offline verification request
+    $('verify-json').textContent = JSON.stringify({
+      waybill_id: wb,
+      seal_id: body.seal_id,
+      start_utc: body.start_utc,
+      end_utc: body.end_utc,
+      retained_digests: p.requested_digests,
+      proof: p
+    }, null, 2);
+  } catch (e) { setStatus('出证失败：' + e.message, true); }
+}
+async function verifyProof() {
+  try {
+    const body = JSON.parse($('verify-json').value);
+    const data = await call('/api/verify', 'POST', body);
+    setStatus(data.valid
+      ? `验真通过：${data.result}，已使用 ${data.retained_digest_used} 条留存摘要`
+      : '验真未通过：' + (data.reason || ''), !data.valid);
+  } catch (e) { setStatus('验真失败：' + e.message, true); }
 }
 function esc(s) { return String(s ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 function renderChain(c) {
